@@ -1,0 +1,241 @@
+pip install transformers open_clip_torch accelerate openai langchain
+
+import os
+from google.colab import drive
+drive.mount('/content/gdrive')
+
+# This is the path to the folder you want to use.
+#folder_path = '/content/gdrive/MyDrive/Schloss Demo Test'
+folder_path = input("Enter your folder path: ")
+
+# os.listdir returns a list of files in a directory.
+files = os.listdir(folder_path)
+
+# Filter out files that aren't images/videos.
+# This simple example only checks the file extension, but you might want to add more robust checks.
+image_files = [file for file in files if file.lower().endswith(('.png', '.jpg', '.jpeg', '.tiff', '.bmp', '.dng', '.gif', '.mp4', '.avi', '.mov', '.heic'))]
+
+# Now image_files is a list of image and video files in the folder.
+# If you need the full path to the files, you can do this:
+image_paths = [os.path.join(folder_path, file) for file in image_files]
+
+CONTEXT = input("Enter your context: ")
+PROMPT = 'My goal is to create a TikTok Clip - I want you to come up with a possible narrative script, showing precisely which images / videos would fit into which part of your script. Ensure that the sentences can be broken down into individual prompts later on and are timeline based. Clarify what the goal of the overall short video in regards to the audience is (e.g. to make them laugh, marvel, cry etc.). The goal is for me to understand how I could use the raw images and videos taken to make a compelling TikTok video'
+#PROMPT = input("Enter your prompt: ")
+
+import torch
+import torchvision.transforms as T
+import open_clip
+from PIL import Image
+import os
+import cv2
+
+# Define the transformations to be applied to the images
+# transform = T.Compose([
+#     T.Resize((224, 224)),
+#     T.ToTensor(),
+#     T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+# ])
+
+image_extensions = ['.jpg', '.jpeg', '.png', '.tiff', '.bmp', '.dng', '.gif']
+video_extensions = ['.mp4', '.avi', '.mov']
+
+def check_file_extension(file):
+    file_extension = file[file.rfind('.'):]
+    if file_extension.lower() in image_extensions:
+        return 'Image'
+    elif file_extension.lower() in video_extensions:
+        return 'Video'
+    else:
+        return 'Unknown'
+
+# Load and transform all the images and videos within the folder
+images = {}
+for i, image_path in enumerate(image_paths):
+  if check_file_extension(image_path) == 'Image':
+    images[i] = Image.open(image_path).convert("RGB")
+
+videos = {}
+for i, image_path in enumerate(image_paths):
+  if check_file_extension(image_path) == 'Video':
+    frames = []
+    video = cv2.VideoCapture(image_path)
+    j = 0
+    while video.isOpened():
+      ret, frame = video.read()
+      if not ret:
+        break
+      j += 1
+      if j % (60*2) == 0:
+        frames.append(Image.fromarray(frame).convert("RGB"))
+    videos[i] = frames
+    video.release()
+
+# Convert to a tensor
+# images_tensor = torch.stack(images)
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Define and load the model
+model, _, transform = open_clip.create_model_and_transforms(
+  model_name="coca_ViT-L-14",
+  pretrained="mscoco_finetuned_laion2B-s13B-b90k"
+)
+model = model.to(device)
+
+# images_tensor = images_tensor.to(device)
+
+# # Pass through the model
+# with torch.no_grad():
+#     model_outputs = model.encode_image(images_tensor)
+
+from tqdm.notebook import tqdm
+captions = {}
+for img_id in tqdm(images):
+  image = images[img_id]
+  im = transform(image).unsqueeze(0).to(device)
+  with torch.no_grad(), torch.cuda.amp.autocast():
+    generated = model.generate(im)
+  caption = open_clip.decode(generated[0])
+  captions[img_id] = caption.replace("<start_of_text>", "").replace("<end_of_text>", "")
+
+for vid_id in tqdm(videos):
+  vids = videos[vid_id]
+  captions[vid_id] = []
+  for vid in tqdm(vids):
+    im = transform(vid).unsqueeze(0).to(device)
+    with torch.no_grad(), torch.cuda.amp.autocast():
+      generated = model.generate(im)
+    caption = open_clip.decode(generated[0])
+    captions[vid_id].append(caption.replace("<start_of_text>", "").replace("<end_of_text>", ""))
+
+from langchain.chat_models import ChatOpenAI
+
+openai_organization = 
+openai_api_key = 
+
+chat = ChatOpenAI(openai_api_key=openai_api_key)
+
+caption_list = ''
+for cid in sorted(captions.keys()):
+  cap = captions[cid]
+  if isinstance(cap, list):
+    tmp = f'{cid+1}. Video of {len(videos[cid])*2} seconds with following scenes:\n'
+    for j, c in enumerate(cap):
+      if c not in tmp:
+        tmp += f'  - {c}\n'
+    caption_list += tmp
+  else:
+    caption_list += f"{cid+1}. Image with following scene: {cap}\n"
+
+print(caption_list)
+
+from langchain.output_parsers import PydanticOutputParser
+from pydantic import BaseModel, Field, validator
+from typing import List
+
+class Scene(BaseModel):
+  time_stamp: int = Field(description='the time stamp in seconds at which this image should appear in the video')
+  item_number: int = Field(description='the number of the file that is added to the output video. The maximum item number should be the total number of items in image_paths')
+  narration_text: str = Field(description='the text that gets added to the video')
+
+class Post(BaseModel):
+  frames: List[Scene] = Field(description='frames in the in the video')
+
+#DEMO_CONTEXT = 'I just got back from a holiday and had following images and videos taken:'
+#DEMO_PROMPT = 'My goal is to create a 30 second TikTok Clip - I want you to come up with a possible narrative script, showing precisely which images / videos would fit into which part of your script. Ensure that the sentences can be broken down into individual prompts later on and are timeline based. Clarify what the goal of the overall short video in regards to the audience is (e.g. to make them laugh, marvel, cry etc.). The goal is for me to understand how I could use the raw images and videos taken to make a compelling TikTok video'
+# caption_list = '\n'.join([f'{i+1}. {caption}' for i, caption in enumerate(captions)])
+
+parser = PydanticOutputParser(pydantic_object=Post)
+
+from langchain import PromptTemplate
+from langchain.prompts.chat import (
+    ChatPromptTemplate,
+    SystemMessagePromptTemplate,
+    AIMessagePromptTemplate,
+    HumanMessagePromptTemplate,
+)
+template='You are InfluencerGPT. A user will ask you to create a storyline for social media given a set of pictures and videos paired with text describing the impact they want their finished content to have on their audience. First create the narrative based on what is available in caption_list and the Context. Then, order the images and video according to which captions best match each piece of the narrative. {format_instructions}'
+system_message_prompt = SystemMessagePromptTemplate.from_template(template)
+human_template="{context}\n{captions}\n{prompt}"
+human_message_prompt = HumanMessagePromptTemplate.from_template(human_template)
+
+chat_prompt = ChatPromptTemplate.from_messages([system_message_prompt, human_message_prompt])
+txt = chat_prompt.format_prompt(
+    format_instructions=parser.get_format_instructions(),
+    context=CONTEXT,
+    captions=caption_list,
+    prompt=PROMPT).to_messages()
+
+output = chat(txt)
+
+parsed = parser.parse(output.content)
+
+#Test Parsed Frames
+parsed.frames
+
+import os
+import shlex
+import subprocess
+import shutil
+
+output_path = './tmp'
+
+if os.path.exists(output_path):
+    shutil.rmtree(output_path)
+
+os.makedirs(output_path)
+
+for i in range(len(parsed.frames)):
+    with open(f'{output_path}/sub{parsed.frames[i].item_number}.srt', 'w') as f:
+      if i < len(parsed.frames) - 1:
+        duration = parsed.frames[i+1].time_stamp - parsed.frames[i].time_stamp
+      else:
+        duration = 3
+      f.write(f"1\n00:00:00,000 --> 00:00:{str(duration).zfill(2)},000\n{parsed.frames[i].narration_text}\n")
+
+# Then, generate the video clips with subtitles
+import os
+
+for i in tqdm(range(len(parsed.frames))):
+    if i < len(parsed.frames) - 1:
+      duration = parsed.frames[i+1].time_stamp - parsed.frames[i].time_stamp
+    else:
+      duration = 3
+    path = image_paths[parsed.frames[i].item_number - 1]
+    if check_file_extension(path) == "Video":
+      cmd=f"ffmpeg -i '{path}' -c:v libx264 -vf 'fps=60,scale=1080:1920,subtitles={output_path}/sub{parsed.frames[i].item_number}.srt' {output_path}/clip{parsed.frames[i].item_number}.mp4"
+      # cmd=f"cp '{path}' {output_path}/clip{parsed.frames[i].item_number}{path[path.rfind('.'):]}"
+    else:
+      cmd = f"ffmpeg -loop 1 -i '{path}' -c:v libx264 -t {duration} -vf 'scale=1080:1920,subtitles={output_path}/sub{parsed.frames[i].item_number}.srt' {output_path}/clip{parsed.frames[i].item_number}.mp4"
+    subprocess.call(shlex.split(cmd))
+
+# Create the list of clips
+
+with open(f'{output_path}/clips.txt', 'w') as f:
+    for i in range(len(parsed.frames)):
+        path = image_paths[parsed.frames[i].item_number - 1]
+        ext = ".mp4"
+        f.write(f"file 'clip{parsed.frames[i].item_number}{ext}'\n")
+
+cmd = f"ffmpeg -f concat -safe 0 -i {output_path}/clips.txt -c copy {output_path}/output.mp4"
+subprocess.call(shlex.split(cmd))
+
+!cp {output_path}/output.mp4 /content/gdrive/MyDrive/
+
+from IPython.display import HTML
+from base64 import b64encode
+
+# Open the video file in binary mode
+with open('/content/gdrive/MyDrive/output.mp4', 'rb') as f:
+    mp4 = f.read()
+
+# Encode the video as base64
+mp4_encoded = b64encode(mp4).decode()
+
+# Display the video in an HTML5 video player
+HTML(f"""
+<video width="240" height="320" controls>
+  <source src="data:video/mp4;base64,{mp4_encoded}" type="video/mp4">
+</video>
+""")
